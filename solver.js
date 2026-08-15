@@ -14,6 +14,10 @@
   const BUTTON_MARK = 'data-yakyo-solver-mark';
   let queued = false;
   let lastSignature = '';
+  let fallbackSafeWins = 0;
+  let fallbackCaught = 0;
+  const seenEventRolls = new Set();
+  const eventsSeenByYear = new Map();
 
   function currentSeed() {
     const fromUrl = new URLSearchParams(location.search).get('seed');
@@ -104,14 +108,79 @@
     return `${label} ${icon}（${Math.round(rate * 100)}%）`;
   }
 
+  async function loadGameState() {
+    // An absolute URL is required in a Manifest V3 MAIN-world content script.
+    // A root-relative import is otherwise resolved against the extension itself.
+    return import(`${location.origin}/src/core/state.js`)
+      .then((module) => module.S)
+      .catch(() => null);
+  }
+
+  function currentStageEventTotal(gameState) {
+    return gameState?.stage === 'PRO' ? 3 : 2;
+  }
+
+  function recordEvent(gameState, usedRngCalls) {
+    if (!gameState) return;
+    const key = `${gameState.year}:${usedRngCalls}`;
+    if (seenEventRolls.has(key)) return;
+    seenEventRolls.add(key);
+    eventsSeenByYear.set(gameState.year, (eventsSeenByYear.get(gameState.year) || 0) + 1);
+  }
+
+  function deadlineEventRange(gameState) {
+    if (!gameState || gameState.age >= 25) return null;
+    const seenThisYear = eventsSeenByYear.get(gameState.year) || 1;
+    const currentRemaining = Math.max(1, currentStageEventTotal(gameState) - seenThisYear + 1);
+    let minimum = currentRemaining;
+    let maximum = currentRemaining;
+
+    for (let age = gameState.age + 1; age <= 24; age++) {
+      const delta = age - gameState.age;
+      if (gameState.stage === 'PRO') {
+        minimum += 3;
+        maximum += 3;
+      } else if (gameState.stage === 'U' && Number(gameState.stageYr || 0) + delta <= 4) {
+        minimum += 2;
+        maximum += 2;
+      } else if (gameState.stage === 'HS' && Number(gameState.stageYr || 0) + delta <= 3) {
+        minimum += 2;
+        maximum += 2;
+      } else {
+        // Future school/amateur routes draw 2 cards; professional routes draw 3.
+        minimum += 2;
+        maximum += 3;
+      }
+    }
+    return { minimum, maximum };
+  }
+
+  function eventRangeText(range, missing) {
+    if (!range) return '';
+    const slots = range.minimum === range.maximum
+      ? `${range.minimum}`
+      : `${range.minimum}～${range.maximum}`;
+    const slackMin = Math.max(0, range.minimum - missing);
+    const slackMax = Math.max(0, range.maximum - missing);
+    const slack = slackMin === slackMax ? `${slackMin}` : `${slackMin}～${slackMax}`;
+    const impossible = range.maximum < missing
+      ? '；即使後面全選保守也來不及'
+      : `；若保守皆成功，理論上還可選大 ${slack} 張`;
+    return `截止前剩餘事件格（含本張）：${slots}${impossible}`;
+  }
+
   function disciplineHint(gameState, safeWins) {
-    if (!gameState) return safeWins
-      ? '本張選保守可增加 1 次成功計數。'
-      : '本張保守也失敗，無法增加成功計數。';
+    if (!gameState) {
+      const missing = Math.max(0, 15 - fallbackSafeWins);
+      return safeWins
+        ? `狀態模組未載入，使用本機備援：${fallbackSafeWins}/15，還差 ${missing} 次；本張保守成功後為 ${Math.min(15, fallbackSafeWins + 1)}/15。`
+        : `狀態模組未載入，使用本機備援：${fallbackSafeWins}/15，還差 ${missing} 次；本張保守失敗，不能計次。`;
+    }
     if (gameState.traits?.disc) return '已解鎖；後續事件可以直接選能成功的最大倍率。';
 
     const count = Number(gameState.cntSaveWin || 0);
     const missing = Math.max(0, 15 - count);
+    const rangeText = eventRangeText(deadlineEventRange(gameState), missing);
     if (gameState.love?.caught > 0) {
       return `目前 ${count}/15，還差 ${missing} 次；但已有外遇／劈腿被抓紀錄，這局已無法解鎖。`;
     }
@@ -119,7 +188,7 @@
       return `目前 ${count}/15，還差 ${missing} 次；25 歲期限已過。`;
     }
     if (!safeWins) {
-      return `目前 ${count}/15，還差 ${missing} 次；本張保守也失敗，不能計次。`;
+      return `目前 ${count}/15，還差 ${missing} 次；本張保守也失敗，不能計次。${rangeText ? `<br>${rangeText}` : ''}`;
     }
 
     const after = Math.min(15, count + 1);
@@ -127,11 +196,11 @@
     if (afterMissing === 0) {
       return `目前 ${count}/15，還差 1 次；本張選保守成功後立即達成 15/15。`;
     }
-    return `目前 ${count}/15，還差 ${missing} 次；本張選保守成功後為 ${after}/15，之後還差 ${afterMissing} 次。`;
+    return `目前 ${count}/15，還差 ${missing} 次；本張選保守成功後為 ${after}/15，之後還差 ${afterMissing} 次。${rangeText ? `<br>${rangeText}` : ''}`;
   }
 
   function romanceDisciplineStatus(gameState) {
-    if (!gameState) return '';
+    if (!gameState) return `自律狂（本機備援）：${fallbackSafeWins}/15，還差 ${Math.max(0, 15 - fallbackSafeWins)} 次；被抓 ${fallbackCaught} 次。`;
     if (gameState.traits?.disc) return '自律狂已解鎖，之後被抓不會移除特性。';
     const count = Number(gameState.cntSaveWin || 0);
     const missing = Math.max(0, 15 - count);
@@ -159,6 +228,12 @@
       const escaped = roll < 0.55;
       mark(romance.secondary, '#167542');
       if (escaped) mark(romance.primary, '#b7791f');
+      if (!romance.primary.dataset.yakyoCaughtTracker) {
+        romance.primary.dataset.yakyoCaughtTracker = '1';
+        romance.primary.addEventListener('click', () => {
+          if (!escaped) fallbackCaught++;
+        }, { once: true });
+      }
       result = [
         fixed,
         escaped
@@ -240,7 +315,7 @@
     }
 
     const roll = rngAt(seed, usedRngCalls);
-    const gameState = await import('/src/core/state.js').then((module) => module.S).catch(() => null);
+    const gameState = await loadGameState();
     if (romance) {
       renderRomance(panel, romance, roll, usedRngCalls, gameState);
       document.querySelector('#act')?.prepend(panel);
@@ -263,6 +338,14 @@
       normal: roll < rates.normal,
       safe: roll < rates.safe
     };
+
+    recordEvent(gameState, usedRngCalls);
+    if (!buttons.safe.dataset.yakyoDisciplineTracker) {
+      buttons.safe.dataset.yakyoDisciplineTracker = '1';
+      buttons.safe.addEventListener('click', () => {
+        if (wins.safe) fallbackSafeWins++;
+      }, { once: true });
+    }
 
     let bestKey;
     let bestLabel;
