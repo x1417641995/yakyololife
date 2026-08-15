@@ -11,9 +11,23 @@
   };
 
   const PANEL_ID = 'yakyo-event-solver';
+  const ALLOC_PANEL_ID = 'yakyo-allocation-advisor';
   const BUTTON_MARK = 'data-yakyo-solver-mark';
+  const ALLOC_MARK = 'data-yakyo-alloc-mark';
+  const ABILITY_LABELS = {
+    sta: '體力', vel: '球速', ctl: '控球', brk: '變化球', con: 'Contact',
+    pow: '力量', spd: '速度', eye: '選球', rng: '守備範圍', fld: '接球',
+    arm: '臂力', cat: '配球'
+  };
+  const POSITION_KEYS = {
+    P: ['sta', 'vel', 'ctl', 'brk'],
+    C: ['sta', 'con', 'pow', 'spd', 'eye', 'rng', 'fld', 'arm', 'cat'],
+    IF: ['sta', 'con', 'pow', 'spd', 'eye', 'rng', 'fld', 'arm'],
+    OF: ['sta', 'con', 'pow', 'spd', 'eye', 'rng', 'fld', 'arm']
+  };
   let queued = false;
   let lastSignature = '';
+  let lastAllocSignature = '';
   let fallbackSafeWins = 0;
   let fallbackCaught = 0;
   const seenEventRolls = new Set();
@@ -103,6 +117,17 @@
     lastSignature = '';
   }
 
+  function clearAllocationAdvisor() {
+    document.getElementById(ALLOC_PANEL_ID)?.remove();
+    document.querySelectorAll(`[${ALLOC_MARK}]`).forEach((row) => {
+      row.removeAttribute(ALLOC_MARK);
+      row.style.removeProperty('outline');
+      row.style.removeProperty('outline-offset');
+      row.style.removeProperty('background');
+    });
+    lastAllocSignature = '';
+  }
+
   function status(label, succeeds, rate) {
     const icon = succeeds ? '✅' : '❌';
     return `${label} ${icon}（${Math.round(rate * 100)}%）`;
@@ -114,6 +139,210 @@
     return import(`${location.origin}/src/core/state.js`)
       .then((module) => module.S)
       .catch(() => null);
+  }
+
+  function abilityCost(gameState, key, level) {
+    const isPitcher = gameState.pos === 'P';
+    let cost = isPitcher
+      ? (level >= 66 ? 7 : level >= 58 ? 4 : level >= 50 ? 2 : 1)
+      : (level >= 72 ? 3 : level >= 64 ? 2 : 1);
+    const potential = Number(gameState.pot?.[key] ?? 62);
+    if (level >= potential) cost *= isPitcher ? 4 : 3;
+    return cost;
+  }
+
+  function simulateAbilitySpend(gameState, key, amount) {
+    let level = Math.max(1, Math.min(80, Math.round(Number(gameState.ab?.[key]) || 1)));
+    let budget = Math.max(0, Number(amount) || 0) + Math.max(0, Number(gameState.carry?.[key]) || 0);
+    while (budget > 0 && level < 80) {
+      const cost = abilityCost(gameState, key, level);
+      if (budget < cost) break;
+      budget -= cost;
+      level++;
+    }
+    const carry = level >= 80 ? 0 : budget;
+    const nextCost = level >= 80 ? 1 : abilityCost(gameState, key, level);
+    return { level, carry, effective: level >= 80 ? 80 : level + carry / nextCost };
+  }
+
+  function effectiveAbilities(gameState) {
+    const values = { ...gameState.ab };
+    (POSITION_KEYS[gameState.pos] || []).forEach((key) => {
+      const level = Number(gameState.ab?.[key]) || 1;
+      const carry = Math.max(0, Number(gameState.carry?.[key]) || 0);
+      const cost = level >= 80 ? 1 : abilityCost(gameState, key, level);
+      values[key] = level >= 80 ? 80 : level + carry / cost;
+    });
+    return values;
+  }
+
+  function defenseScore(position, abilities) {
+    const a = abilities;
+    switch (position) {
+      case 'SS': return a.rng * 0.5 + a.fld * 0.3 + a.arm * 0.2;
+      case '2B': return a.rng * 0.45 + a.fld * 0.4 + a.arm * 0.15;
+      case '3B': return a.arm * 0.45 + a.fld * 0.35 + a.rng * 0.2;
+      case 'CF': return a.rng * 0.55 + a.fld * 0.3 + a.arm * 0.15;
+      case 'RF': return a.arm * 0.45 + a.rng * 0.35 + a.fld * 0.2;
+      case 'LF': return a.rng * 0.4 + a.fld * 0.35 + a.arm * 0.25;
+      case 'C': return a.fld * 0.4 + a.cat * 0.4 + a.arm * 0.2;
+      case '1B': return a.fld * 0.6 + a.rng * 0.2 + a.arm * 0.2;
+      default: return 0;
+    }
+  }
+
+  function rawOvr(gameState, abilities) {
+    const a = abilities;
+    if (gameState.pos === 'P') {
+      const ordered = [a.vel, a.ctl, a.brk].sort((x, y) => y - x);
+      return ordered[0] * 0.42 + ordered[1] * 0.30 + ordered[2] * 0.18 + a.sta * 0.10;
+    }
+    const offense = [a.con, a.pow, a.eye, a.spd].sort((x, y) => y - x);
+    const offenseScore = offense[0] * 0.38 + offense[1] * 0.27 + offense[2] * 0.20 + offense[3] * 0.15;
+    const position = gameState.dpos || (gameState.pos === 'C' ? 'C' : (gameState.pos === 'OF' ? 'CF' : 'SS'));
+    const defense = position === 'DH' ? defenseScore('1B', a) - 12 : defenseScore(position, a);
+    const defenseWeight = gameState.dpos
+      ? ({ SS: 0.30, CF: 0.30, C: 0.30, '2B': 0.22, '3B': 0.22, RF: 0.20, '1B': 0.12, LF: 0.14, DH: 0.12 }[gameState.dpos] ?? 0.22)
+      : 0.24;
+    return offenseScore * (1 - defenseWeight) + defense * defenseWeight;
+  }
+
+  function displayedOvr(gameState, abilities) {
+    return Math.round(rawOvr(gameState, abilities)) - (gameState.traits?.yips ? 3 : 0);
+  }
+
+  function proCore(gameState, abilities) {
+    if (gameState.pos === 'P') return (abilities.vel + abilities.ctl + abilities.brk) / 3;
+    return abilities.con * 0.5 + abilities.pow * 0.2 + abilities.eye * 0.18 + abilities.spd * 0.12;
+  }
+
+  function championshipProfile(gameState) {
+    const level = String(gameState.lv || '');
+    const org = gameState.org || (level.startsWith('CPBL') ? 'CPBL' : level.startsWith('NPB') ? 'NPB' : 'MiLB');
+    const pitcher = gameState.pos === 'P';
+    const effortAdjustment = pitcher
+      ? ({ '全力投': 1, '普通投': 0, '養生球': -1 }[gameState.effort] || 0)
+      : 0;
+    return {
+      CPBL: { name: '中職總冠軍', target: pitcher ? 66 - effortAdjustment : 66.5 },
+      NPB: { name: '日本一', target: pitcher ? 67 - effortAdjustment : 67.5 },
+      MiLB: { name: '世界大賽冠軍', target: pitcher ? 70 - effortAdjustment : 70.5 }
+    }[org] || null;
+  }
+
+  function amateurGuarantee(gameState) {
+    if (gameState.stage === 'HS') {
+      const bonus = ({ 1: 6, 2: 0, 3: -6 })[Number(gameState.hsTier || 2)] || 0;
+      return 52 - bonus + 8;
+    }
+    if (gameState.stage === 'U' || gameState.stage === 'AMA') return 68;
+    return null;
+  }
+
+  function markAllocationRow(row) {
+    row.setAttribute(ALLOC_MARK, '1');
+    row.style.setProperty('outline', '3px solid #167542', 'important');
+    row.style.setProperty('outline-offset', '-3px', 'important');
+    row.style.setProperty('background', '#dcebd8', 'important');
+  }
+
+  function renderAllocationAdvisor(gameState) {
+    const rows = [...document.querySelectorAll('#al-rows .abrow')];
+    const keys = POSITION_KEYS[gameState?.pos] || [];
+    if (!gameState || !rows.length || rows.length !== keys.length) return;
+    if (!rows.some((row) => typeof row.onclick === 'function')) {
+      clearAllocationAdvisor();
+      return;
+    }
+
+    const activeDie = document.querySelector('#dice .die.active');
+    const amount = activeDie ? Number(activeDie.textContent.trim()) : 1;
+    const signature = [
+      gameState.year, gameState.stage, gameState.lv, gameState.dpos, amount,
+      ...keys.flatMap((key) => [gameState.ab?.[key], gameState.carry?.[key] || 0])
+    ].join('|');
+    if (signature === lastAllocSignature && document.getElementById(ALLOC_PANEL_ID)) return;
+    lastAllocSignature = signature;
+
+    document.getElementById(ALLOC_PANEL_ID)?.remove();
+    rows.forEach((row) => {
+      row.removeAttribute(ALLOC_MARK);
+      row.style.removeProperty('outline');
+      row.style.removeProperty('outline-offset');
+      row.style.removeProperty('background');
+    });
+
+    const currentEffective = effectiveAbilities(gameState);
+    const currentActual = { ...gameState.ab };
+    const professional = gameState.stage === 'PRO';
+    const currentMetric = professional ? proCore(gameState, currentEffective) : rawOvr(gameState, currentEffective);
+    const candidates = keys.map((key, index) => {
+      if ((Number(gameState.ab?.[key]) || 0) >= 80) return null;
+      const spent = simulateAbilitySpend(gameState, key, amount);
+      const effectiveAfter = { ...currentEffective, [key]: spent.effective };
+      const actualAfter = { ...currentActual, [key]: spent.level };
+      const metricAfter = professional ? proCore(gameState, effectiveAfter) : rawOvr(gameState, effectiveAfter);
+      return {
+        key,
+        index,
+        spent,
+        gain: metricAfter - currentMetric,
+        actualOvr: displayedOvr(gameState, actualAfter),
+        core: proCore(gameState, effectiveAfter)
+      };
+    }).filter(Boolean).sort((a, b) => b.gain - a.gain || a.index - b.index);
+    if (!candidates.length) return;
+
+    const bestGain = candidates[0].gain;
+    const best = candidates.filter((candidate) => Math.abs(candidate.gain - bestGain) < 0.000001);
+    best.forEach((candidate) => markAllocationRow(rows[candidate.index]));
+
+    const currentOvr = displayedOvr(gameState, currentActual);
+    const topDetails = candidates.slice(0, 3).map((candidate) => {
+      const levelText = candidate.spent.level > Number(gameState.ab[candidate.key])
+        ? `${gameState.ab[candidate.key]}→${candidate.spent.level}`
+        : `蓄力 ${candidate.spent.carry}/${abilityCost(gameState, candidate.key, candidate.spent.level)}`;
+      const gainText = professional
+        ? `冠軍核心 +${candidate.gain.toFixed(3)}`
+        : `OVR 進度 +${candidate.gain.toFixed(3)}`;
+      return `${ABILITY_LABELS[candidate.key]}（${levelText}，${gainText}）`;
+    }).join('<br>');
+
+    let objective;
+    if (professional) {
+      const profile = championshipProfile(gameState);
+      const currentCore = proCore(gameState, currentActual);
+      const gap = profile ? Math.max(0, profile.target - currentCore) : 0;
+      objective = profile
+        ? `目前冠軍核心 <b>${currentCore.toFixed(2)}</b>；${profile.name}機率上限目標 <b>${profile.target}</b>，還差 <b>${gap.toFixed(2)}</b>。`
+        : `目前冠軍核心 <b>${currentCore.toFixed(2)}</b>。`;
+    } else {
+      const guarantee = amateurGuarantee(gameState);
+      const gap = guarantee === null ? null : Math.max(0, guarantee - currentOvr);
+      objective = guarantee === null
+        ? `目前 OVR <b>${currentOvr}</b>。`
+        : `目前 OVR <b>${currentOvr}</b>；本路線最差亂數保證冠軍線 <b>${guarantee}</b>，還差 <b>${gap}</b>。`;
+    }
+
+    const panel = document.createElement('div');
+    panel.id = ALLOC_PANEL_ID;
+    panel.style.cssText = [
+      'margin:10px 0 4px',
+      'padding:11px 13px',
+      'border:2px solid #315c43',
+      'background:#f4f0df',
+      'color:#1f2e24',
+      'font-size:13px',
+      'line-height:1.6'
+    ].join(';');
+    panel.innerHTML = [
+      `<div style="font-weight:800;font-size:16px">加點推薦｜本次投入 ${amount} 點</div>`,
+      `<div>${objective}</div>`,
+      `<div style="color:#126b3b;font-weight:800">綠框優先：${best.map((candidate) => ABILITY_LABELS[candidate.key]).join('／')}</div>`,
+      `<div style="opacity:.82">本次收益前三名：<br>${topDetails}</div>`,
+      '<div style="opacity:.7">每次點完會依新等級、蓄力、成本與潛力重新計算。</div>'
+    ].join('');
+    document.getElementById('al-top')?.appendChild(panel);
   }
 
   function currentStageEventTotal(gameState) {
@@ -270,6 +499,14 @@
 
   async function render() {
     queued = false;
+    const allocationRows = document.querySelectorAll('#al-rows .abrow');
+    if (allocationRows.length) {
+      removePanel();
+      const gameState = await loadGameState();
+      renderAllocationAdvisor(gameState);
+      return;
+    }
+    clearAllocationAdvisor();
     const buttons = eventButtons();
     const romance = buttons ? null : romanceChoice();
     if (!buttons && !romance) {

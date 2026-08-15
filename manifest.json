@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YaKyoLife 全路線事件解答器",
-  "version": "1.2.0",
-  "description": "依目前遊戲路線的固定 RNG，顯示每個事件選項是否成功並推薦最大成功倍率。",
+  "version": "1.3.0",
+  "description": "解讀固定 RNG、事件選項與能力分配，即時推薦目前路線的最大收益選擇。",
   "content_scripts": [
     {
       "matches": ["https://www.yakyolife.com/*"],
